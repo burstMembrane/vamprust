@@ -1,8 +1,8 @@
 GIT_HASH_SHORT=$(git rev-parse --short HEAD)
 BRANCH=$(git rev-parse --abbrev-ref HEAD)
-simple_host_cmd="simple_host"
+simple_host_cmd="vamp-simple-host-rs"
 cmd_one="./vamp-plugin-sdk/build/vamp-simple-host nnls-chroma:chordino test.wav"
-cmd_two="simple_host nnls-chroma:chordino test.wav"
+cmd_two="vamp-simple-host-rs nnls-chroma:chordino test.wav"
 mkdir -p benchmarks
 hyperfine --warmup 3 "$cmd_one" "$cmd_two" --export-markdown benchmarks/shootout_${GIT_HASH_SHORT}_${BRANCH}.md
 

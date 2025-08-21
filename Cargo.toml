@@ -22,5 +22,12 @@ name = "basic_usage"
 path = "examples/basic_usage.rs"
 
 [[example]]
-name = "simple_host"
+name = "vamp-simple-host-rs"
 path = "examples/simple_host.rs"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
