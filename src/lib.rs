@@ -118,7 +118,7 @@ impl VampLibrary {
             if symbol.is_null() {
                 return None;
             }
-            Some(std::mem::transmute(symbol))
+            Some(std::mem::transmute::<*mut c_void, VampGetPluginDescriptorFn>(symbol))
         }
     }
 
@@ -212,16 +212,16 @@ pub enum InputDomain {
 pub struct VampPlugin {
     pub handle: VampPluginHandle,
     pub descriptor: *const VampPluginDescriptor,
-    sample_rate: f32,
+    pub sample_rate: f32,
 }
 
 impl VampPlugin {
     pub fn get_input_domain(&self) -> InputDomain {
         unsafe {
             match (*self.descriptor).inputDomain {
-                0 => InputDomain::TimeDomain,  // vampTimeDomain
-                1 => InputDomain::FrequencyDomain,  // vampFrequencyDomain
-                _ => InputDomain::TimeDomain,  // default
+                0 => InputDomain::TimeDomain,      // vampTimeDomain
+                1 => InputDomain::FrequencyDomain, // vampFrequencyDomain
+                _ => InputDomain::TimeDomain,      // default
             }
         }
     }
@@ -231,7 +231,7 @@ impl VampPlugin {
             if let Some(get_preferred_block) = (*self.descriptor).getPreferredBlockSize {
                 get_preferred_block(self.handle)
             } else {
-                1024  // default
+                1024 // default
             }
         }
     }
@@ -241,7 +241,7 @@ impl VampPlugin {
             if let Some(get_preferred_step) = (*self.descriptor).getPreferredStepSize {
                 get_preferred_step(self.handle)
             } else {
-                0  // 0 means use default based on domain
+                0 // 0 means use default based on domain
             }
         }
     }
@@ -282,11 +282,12 @@ impl VampPlugin {
         }
     }
 
-    pub fn release_feature_set(&self, features: *mut VampFeatureList) {
-        unsafe {
-            if let Some(release) = (*self.descriptor).releaseFeatureSet {
-                release(features);
-            }
+    /// # Safety
+    /// The caller must ensure that `features` is a valid pointer returned from a previous
+    /// call to `process()` or `get_remaining_features()`.
+    pub unsafe fn release_feature_set(&self, features: *mut VampFeatureList) {
+        if let Some(release) = (*self.descriptor).releaseFeatureSet {
+            release(features);
         }
     }
 

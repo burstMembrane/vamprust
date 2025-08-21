@@ -1,29 +1,27 @@
+use env_logger;
+use log::{debug, info, warn};
+use realfft::{RealFftPlanner, RealToComplex};
+use rustfft::num_complex::Complex;
 use sndfile::{OpenOptions, ReadOptions, SndFileIO};
 use std::env;
+use std::f32::consts::PI;
 use std::ffi::CStr;
 use std::fs::File;
 use std::io::{self, Write};
-use std::path::Path;
-use vamprust::{InputDomain, PluginInfo, VampHost};
-use realfft::{RealFftPlanner, ComplexToReal, RealToComplex};
-use rustfft::num_complex::Complex;
-use std::f32::consts::PI;
+use vamprust::{InputDomain, VampHost};
 
 const HOST_VERSION: &str = "0.1.0";
 
 fn usage(name: &str) {
-    eprintln!("");
     eprintln!(
         "{}: A command-line host for Vamp audio analysis plugins.",
         name
     );
-    eprintln!("");
     eprintln!("Centre for Digital Music, Queen Mary, University of London.");
     eprintln!("Copyright 2006-2009 Chris Cannam and QMUL.");
     eprintln!("Freely redistributable; published under a BSD-style license.");
-    eprintln!("");
-    eprintln!("Usage:");
-    eprintln!("");
+    eprintln!("Rust port by Liam Power [https://github.com/burstMembrane]");
+    eprintln!("Usage:\n");
     eprintln!(
         "  {} [-s] pluginlibrary[.dylib]:plugin[:output] file.wav [-o out.txt]",
         name
@@ -32,55 +30,37 @@ fn usage(name: &str) {
         "  {} [-s] pluginlibrary[.dylib]:plugin file.wav [outputno] [-o out.txt]",
         name
     );
-    eprintln!("");
     eprintln!("    -- Load plugin id \"plugin\" from \"pluginlibrary\" and run it on the");
     eprintln!("       audio data in \"file.wav\", retrieving the named \"output\", or output");
     eprintln!("       number \"outputno\" (the first output by default) and dumping it to");
-    eprintln!("       standard output, or to \"out.txt\" if the -o option is given.");
-    eprintln!("");
+    eprintln!("       standard output, or to \"out.txt\" if the -o option is given.\n");
     eprintln!("       \"pluginlibrary\" should be a library name, not a file path; the");
     eprintln!("       standard Vamp library search path will be used to locate it.  If");
     eprintln!("       a file path is supplied, the directory part(s) will be ignored.");
-    eprintln!("");
-    eprintln!("       If the -s option is given, results will be labelled with the audio");
+    eprintln!("       If the -s option is given, results will be labelled with the audio \n");
     eprintln!("       sample frame at which they occur. Otherwise, they will be labelled");
     eprintln!("       with time in seconds.");
-    eprintln!("");
-    eprintln!("  {} -l", name);
+    eprintln!("\n  {} -l", name);
     eprintln!("  {} --list", name);
-    eprintln!("");
     eprintln!("    -- List the plugin libraries and Vamp plugins in the library search path");
     eprintln!("       in a verbose human-readable format.");
-    eprintln!("");
-    eprintln!("  {} -L", name);
+    eprintln!("\n  {} -L", name);
     eprintln!("  {} --list-full", name);
-    eprintln!("");
     eprintln!("    -- List all data reported by all the Vamp plugins in the library search");
     eprintln!("       path in a very verbose human-readable format.");
-    eprintln!("");
-    eprintln!("  {} --list-ids", name);
-    eprintln!("");
+    eprintln!("\n  {} --list-ids", name);
     eprintln!("    -- List the plugins in the search path in a terse machine-readable format,");
     eprintln!("       in the form vamp:soname:identifier.");
-    eprintln!("");
-    eprintln!("  {} --list-outputs", name);
-    eprintln!("");
+    eprintln!("\n  {} --list-outputs", name);
     eprintln!("    -- List the outputs for plugins in the search path in a machine-readable");
     eprintln!("       format, in the form vamp:soname:identifier:output.");
-    eprintln!("");
-    eprintln!("  {} --list-by-category", name);
-    eprintln!("");
+    eprintln!("\n  {} --list-by-category", name);
     eprintln!("    -- List the plugins as a plugin index by category, in a machine-readable");
     eprintln!("       format.  The format may change in future releases.");
-    eprintln!("");
-    eprintln!("  {} -p", name);
-    eprintln!("");
+    eprintln!("\n  {} -p", name);
     eprintln!("    -- Print out the Vamp library search path.");
-    eprintln!("");
-    eprintln!("  {} -v", name);
-    eprintln!("");
+    eprintln!("\n  {} -v", name);
     eprintln!("    -- Display version information only.");
-    eprintln!("");
     std::process::exit(2);
 }
 
@@ -104,12 +84,21 @@ fn get_plugin_output_descriptors_safe(plugin: &vamprust::VampPlugin) -> Vec<(Str
     if plugin_info_matches_chordino(plugin) {
         return vec![
             ("simplechord".to_string(), "Chord Estimate".to_string()),
-            ("chordnotes".to_string(), "Note Representation of Chord Estimate".to_string()),
-            ("harmonicchange".to_string(), "Harmonic Change Value".to_string()),
-            ("loglikelihood".to_string(), "Chord Log Likelihood".to_string()),
+            (
+                "chordnotes".to_string(),
+                "Note Representation of Chord Estimate".to_string(),
+            ),
+            (
+                "harmonicchange".to_string(),
+                "Harmonic Change Value".to_string(),
+            ),
+            (
+                "loglikelihood".to_string(),
+                "Chord Log Likelihood".to_string(),
+            ),
         ];
     }
-    
+
     // For other plugins, return a default
     vec![("output_0".to_string(), "Output 0".to_string())]
 }
@@ -117,48 +106,6 @@ fn get_plugin_output_descriptors_safe(plugin: &vamprust::VampPlugin) -> Vec<(Str
 fn plugin_info_matches_chordino(_plugin: &vamprust::VampPlugin) -> bool {
     // Simple check - we can improve this later
     true // For now assume it's chordino since we're testing with it
-}
-
-fn get_plugin_output_descriptors_original(plugin: &vamprust::VampPlugin) -> Vec<(String, String)> {
-    let mut outputs = Vec::new();
-    unsafe {
-        let desc = &*plugin.descriptor;
-        if let Some(get_output_descriptor) = desc.getOutputDescriptor {
-            // Query output descriptors one by one until we get null
-            let mut i = 0;
-            loop {
-                let output_desc_ptr = get_output_descriptor(plugin.handle, i);
-                if output_desc_ptr.is_null() {
-                    break;
-                }
-
-                let output_desc = &*output_desc_ptr;
-                let identifier = if output_desc.identifier.is_null() {
-                    format!("output_{}", i)
-                } else {
-                    CStr::from_ptr(output_desc.identifier)
-                        .to_string_lossy()
-                        .into_owned()
-                };
-                let name = if output_desc.name.is_null() {
-                    identifier.clone()
-                } else {
-                    CStr::from_ptr(output_desc.name)
-                        .to_string_lossy()
-                        .into_owned()
-                };
-                outputs.push((identifier, name));
-
-                // Clean up this descriptor
-                if let Some(release_output_descriptor) = desc.releaseOutputDescriptor {
-                    release_output_descriptor(output_desc_ptr);
-                }
-
-                i += 1;
-            }
-        }
-    }
-    outputs
 }
 
 fn list_plugins_basic() {
@@ -334,15 +281,18 @@ fn process_fft_frame(
     if copy_len < input_buffer.len() {
         input_buffer[copy_len..].fill(0.0);
     }
-    
+
     // Apply windowing
     apply_hann_window(input_buffer);
-    
+
     // Perform real-to-complex FFT
     fft.process(input_buffer, output_buffer)
 }
 
 fn main() {
+    // Initialize env_logger - users can set RUST_LOG=debug for verbose output
+    env_logger::init();
+    
     let args: Vec<String> = env::args().collect();
     let prog_name = &args[0];
 
@@ -460,7 +410,7 @@ fn main() {
     };
 
     // Read the audio file using libsndfile (like the original)
-    println!("Reading audio file: {}", audio_file);
+    info!("Reading audio file: {}", audio_file);
     let mut sndfile = match OpenOptions::ReadOnly(ReadOptions::Auto).from_path(&audio_file) {
         Ok(f) => f,
         Err(e) => {
@@ -473,12 +423,12 @@ fn main() {
     let channels = sndfile.get_channels() as usize;
     let frames = sndfile.len().unwrap_or(0);
 
-    println!("Audio file info:");
-    println!("  Sample rate: {} Hz", sample_rate);
-    println!("  Channels: {}", channels);
-    println!("  Frames: {}", frames);
+    info!("Audio file info:");
+    info!("  Sample rate: {} Hz", sample_rate);
+    info!("  Channels: {}", channels);
+    info!("  Frames: {}", frames);
     if frames > 0 {
-        println!("  Duration: {:.2} seconds", frames as f32 / sample_rate);
+        info!("  Duration: {:.2} seconds", frames as f32 / sample_rate);
     }
 
     // Read all samples as f32 - this should give us interleaved data
@@ -514,7 +464,7 @@ fn main() {
             std::process::exit(1);
         });
 
-    println!("\nLoading library: {}", library_path.display());
+    info!("Loading library: {}", library_path.display());
     let library = host.load_library(library_path).unwrap_or_else(|| {
         eprintln!("Failed to load library");
         std::process::exit(1);
@@ -534,7 +484,7 @@ fn main() {
             std::process::exit(1);
         });
 
-    println!(
+    info!(
         "Using plugin: {} ({})",
         plugin_info.identifier, plugin_info.name
     );
@@ -553,7 +503,7 @@ fn main() {
     for (i, (id, name)) in outputs.iter().enumerate() {
         println!("  [{}] {}: {}", i, id, name);
     }
-    
+
     let target_output_index = if let Some(output_id) = output_id {
         // Find output by identifier
         outputs
@@ -584,13 +534,19 @@ fn main() {
         // For chordino, default to "simplechord" output (index 0)
         if plugin_info_matches_chordino(&plugin) {
             // Look for "simplechord" output
-            outputs.iter().position(|(id, _)| id == "simplechord").unwrap_or(0)
+            outputs
+                .iter()
+                .position(|(id, _)| id == "simplechord")
+                .unwrap_or(0)
         } else {
             0
         }
     };
-    
-    println!("Using output [{}]: {}", target_output_index, outputs[target_output_index].0);
+
+    println!(
+        "Using output [{}]: {}",
+        target_output_index, outputs[target_output_index].0
+    );
 
     // Get preferred block and step sizes from the plugin
     let preferred_block_size = unsafe {
@@ -616,15 +572,15 @@ fn main() {
     };
     // Check input domain first to determine proper step size
     let input_domain = plugin.get_input_domain();
-    
+
     let step_size = if preferred_step_size > 0 {
         preferred_step_size as usize
     } else {
         // Follow the C implementation logic
         if input_domain == InputDomain::FrequencyDomain {
-            block_size / 2  // 50% overlap for frequency domain
+            block_size / 2 // 50% overlap for frequency domain
         } else {
-            block_size     // No overlap for time domain
+            block_size // No overlap for time domain
         }
     };
 
@@ -633,15 +589,26 @@ fn main() {
     println!("  Preferred step size: {}", step_size);
 
     // For nnls-chroma plugins, start with mono directly since they typically expect mono input
-    let mut processing_channels = if plugin_info.identifier.contains("chordino") || library_name.contains("nnls-chroma") {
-        1  // Force mono for nnls-chroma plugins
-    } else {
-        channels
-    };
+    let mut processing_channels =
+        if plugin_info.identifier.contains("chordino") || library_name.contains("nnls-chroma") {
+            1 // Force mono for nnls-chroma plugins
+        } else {
+            channels
+        };
 
-    println!("Attempting to initialize plugin with {} channels, step size {}, block size {}", processing_channels, step_size, block_size);
-    if !plugin.initialise(processing_channels as u32, step_size as u32, block_size as u32) {
-        eprintln!("Failed to initialize plugin with {} channels", processing_channels);
+    println!(
+        "Attempting to initialize plugin with {} channels, step size {}, block size {}",
+        processing_channels, step_size, block_size
+    );
+    if !plugin.initialise(
+        processing_channels as u32,
+        step_size as u32,
+        block_size as u32,
+    ) {
+        eprintln!(
+            "Failed to initialize plugin with {} channels",
+            processing_channels
+        );
         // Try with mono if not already trying mono
         if processing_channels != 1 {
             println!("Trying with mono input...");
@@ -649,79 +616,94 @@ fn main() {
                 eprintln!("Failed to initialize plugin even with mono input");
                 std::process::exit(1);
             }
-            processing_channels = 1;  // Update for the rest of the function
+            processing_channels = 1; // Update for the rest of the function
             println!("Successfully initialized with 1 channel - will mix stereo to mono");
         } else {
             std::process::exit(1);
         }
     } else {
-        println!("Successfully initialized with {} channels", processing_channels);
+        println!(
+            "Successfully initialized with {} channels",
+            processing_channels
+        );
     }
 
     println!("Plugin initialized with:");
     println!("  Block size: {}", block_size);
     println!("  Step size: {}", step_size);
 
-    println!("Plugin input domain: {:?}", input_domain);
-    
+    info!("Plugin input domain: {:?}", input_domain);
+
     // Create RealFFT plan and buffers if needed
-    let (fft_plan, mut fft_input_buffer, mut fft_output_buffer) = if input_domain == InputDomain::FrequencyDomain {
-        println!("Plugin requires frequency domain input - will perform RealFFT");
-        let mut planner = RealFftPlanner::<f32>::new();
-        let fft = planner.plan_fft_forward(block_size);
-        
-        // Pre-allocate buffers
-        let input_buf = fft.make_input_vec();
-        let output_buf = fft.make_output_vec();
-        
-        println!("RealFFT buffer sizes: input={}, output={}", input_buf.len(), output_buf.len());
-        
-        (Some(fft), Some(input_buf), Some(output_buf))
-    } else {
-        println!("Plugin uses time domain input");
-        (None, None, None)
-    };
+    let (fft_plan, mut fft_input_buffer, mut fft_output_buffer) =
+        if input_domain == InputDomain::FrequencyDomain {
+            info!("Plugin requires frequency domain input - will perform RealFFT");
+            let mut planner = RealFftPlanner::<f32>::new();
+            let fft = planner.plan_fft_forward(block_size);
+
+            // Pre-allocate buffers
+            let input_buf = fft.make_input_vec();
+            let output_buf = fft.make_output_vec();
+
+            debug!(
+                "RealFFT buffer sizes: input={}, output={}",
+                input_buf.len(),
+                output_buf.len()
+            );
+
+            (Some(fft), Some(input_buf), Some(output_buf))
+        } else {
+            info!("Plugin uses time domain input");
+            (None, None, None)
+        };
 
     // Process the audio in chunks
-    println!("\nProcessing audio...");
+    info!("Processing audio...");
 
     let mut timestamp_sec = 0;
     let mut timestamp_nsec = 0;
     let mut sample_index = 0;
     let mut current_step = 0;
-    
+
     // Calculate overlap size for frequency domain processing
     let overlap_size = block_size - step_size;
-    println!("Overlap size: {} samples", overlap_size);
-    
+    debug!("Overlap size: {} samples", overlap_size);
+
     // Pre-allocate persistent audio buffers for overlapping
     let mut audio_buffer: Vec<Vec<f32>> = vec![vec![0.0; block_size]; processing_channels];
 
-    let total_samples = samples.len();
-    let mut final_steps_remaining = if block_size > step_size { (block_size / step_size).max(1) } else { 1 };
-    
+    let mut final_steps_remaining = if block_size > step_size {
+        (block_size / step_size).max(1)
+    } else {
+        1
+    };
+
     while final_steps_remaining > 0 {
-        let mut frames_to_read = if (block_size == step_size) || (current_step == 0) {
-            // Read a full fresh block (like C code line 535)
+        let frames_to_read = if (block_size == step_size) || (current_step == 0) {
+            // Read a full fresh block
             block_size
         } else {
-            // Move existing data down and read remainder (like C code lines 547-548)
+            // Move existing data down and read remainder
             for ch in 0..processing_channels {
                 audio_buffer[ch].copy_within(step_size..block_size, 0);
             }
             step_size
         };
-        
+
         // Read frames from input, handling stereo to mono conversion
         let mut frames_read = 0;
-        let start_pos = if (block_size == step_size) || (current_step == 0) { 0 } else { overlap_size };
-        
+        let start_pos = if (block_size == step_size) || (current_step == 0) {
+            0
+        } else {
+            overlap_size
+        };
+
         for frame in 0..frames_to_read {
             let frame_start = sample_index + frame * channels;
             if frame_start >= samples.len() {
                 break;
             }
-            
+
             for ch in 0..processing_channels {
                 let buffer_pos = start_pos + frame;
                 if processing_channels == 1 && channels == 2 {
@@ -745,7 +727,7 @@ fn main() {
             }
             frames_read += 1;
         }
-        
+
         if frames_read != frames_to_read {
             // Pad with zeros and decrease remaining steps
             final_steps_remaining -= 1;
@@ -757,21 +739,23 @@ fn main() {
                 }
             }
         }
-        
+
         // Process based on input domain
         let mut fft_buffers: Vec<Vec<f32>> = Vec::new();
         let buffer_refs: Vec<&[f32]> = if input_domain == InputDomain::FrequencyDomain {
             // Apply RealFFT to each channel
-            if let (Some(ref plan), Some(ref mut input_buf), Some(ref mut output_buf)) = 
-                (&fft_plan, &mut fft_input_buffer, &mut fft_output_buffer) {
-                
+            if let (Some(ref plan), Some(ref mut input_buf), Some(ref mut output_buf)) =
+                (&fft_plan, &mut fft_input_buffer, &mut fft_output_buffer)
+            {
                 for ch in 0..processing_channels {
                     // Perform RealFFT on the full block
-                    if let Err(e) = process_fft_frame(&audio_buffer[ch], plan, input_buf, output_buf) {
-                        eprintln!("FFT processing error: {:?}", e);
+                    if let Err(e) =
+                        process_fft_frame(&audio_buffer[ch], plan, input_buf, output_buf)
+                    {
+                        warn!("FFT processing error: {:?}", e);
                         continue;
                     }
-                    
+
                     // Convert complex FFT result to interleaved real/imaginary format
                     let mut interleaved = Vec::with_capacity(output_buf.len() * 2);
                     for complex in output_buf.iter() {
@@ -781,7 +765,7 @@ fn main() {
                     fft_buffers.push(interleaved);
                 }
             }
-            
+
             fft_buffers.iter().map(|v| v.as_slice()).collect()
         } else {
             // Time domain - use audio buffers directly
@@ -794,15 +778,9 @@ fn main() {
                 let features = &*features_ptr;
 
                 // Print features similar to vamp-simple-host
-                if features.featureCount > 0 {
-                    println!("DEBUG: process() returned {} features", features.featureCount);
-                }
                 if features.featureCount > 0 && !features.features.is_null() {
                     for i in 0..features.featureCount {
                         let feature = &(*features.features.add(i as usize)).v1;
-                        println!("DEBUG: Feature {} - hasTimestamp: {}, valueCount: {}", 
-                                i, feature.hasTimestamp, feature.valueCount);
-
                         // Calculate time from current position
                         let time_samples = sample_index / channels;
                         let time_sec = time_samples as f64 / sample_rate as f64;
@@ -854,20 +832,18 @@ fn main() {
         // Update sample position and step counter
         sample_index += frames_to_read * channels;
         current_step += 1;
-        
-        // Update timestamp for next iteration (like C code line 581)  
+
+        // Update timestamp for next iteration (like C code line 581)
         let timestamp_samples = current_step * step_size;
         timestamp_sec = (timestamp_samples as f64 / sample_rate as f64) as i32;
-        timestamp_nsec = (((timestamp_samples as f64 / sample_rate as f64) % 1.0) * 1_000_000_000.0) as i32;
+        timestamp_nsec =
+            (((timestamp_samples as f64 / sample_rate as f64) % 1.0) * 1_000_000_000.0) as i32;
     }
 
     // Get remaining features
-    println!("DEBUG: Calling getRemainingFeatures()");
     if let Some(remaining_ptr) = plugin.get_remaining_features() {
         unsafe {
             let remaining = &*remaining_ptr;
-            println!("DEBUG: getRemainingFeatures() returned {} features", remaining.featureCount);
-
             if remaining.featureCount > 0 && !remaining.features.is_null() {
                 for i in 0..remaining.featureCount {
                     let feature = &(*remaining.features.add(i as usize)).v1;
@@ -876,8 +852,6 @@ fn main() {
                     } else {
                         "No label".to_string()
                     };
-                    println!("DEBUG: Remaining feature {} - hasTimestamp: {}, valueCount: {}, label: '{}'", 
-                            i, feature.hasTimestamp, feature.valueCount, label_str);
 
                     // Print timestamp if available (for remaining features)
                     if use_frames {
@@ -919,6 +893,5 @@ fn main() {
         }
     }
 
-    println!("\nProcessing complete.");
+    info!("Processing complete.");
 }
-
