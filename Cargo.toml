@@ -10,11 +10,10 @@ pkg-config = "0.3"
 
 [dependencies]
 libc = "0.2"
-hound = "3.5"
 sndfile = "0.1.1"
-realfft = "3.4"
+realfft = { version = "3.4", features = ["avx"] }
 rustfft = "6.4.0"
-env_logger = "0.11.8"
+env_logger = { version = "0.11.8", default-features = false, features = ["color"] }
 log = "0.4"
 
 [[example]]
@@ -30,4 +29,11 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 panic = "abort"
+debug = false
+overflow-checks = false
+strip = true
+
+[profile.release.build-override]
+opt-level = 3
+codegen-units = 1
 

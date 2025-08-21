@@ -7,6 +7,6 @@ mkdir -p benchmarks
 hyperfine --warmup 3 "$cmd_one" "$cmd_two" --export-markdown benchmarks/shootout_${GIT_HASH_SHORT}_${BRANCH}.md
 
 cmd_three="vamp-simple-host vamp-example-plugins:percussiononsets test.wav"
-cmd_four="simple_host vamp-example-plugins:percussiononsets test.wav"
+cmd_four="vamp-simple-host-rs vamp-example-plugins:percussiononsets test.wav"
 
 hyperfine --warmup 3 "$cmd_three" "$cmd_four" --export-markdown benchmarks/shootout_${GIT_HASH_SHORT}_${BRANCH}_percussiononsets.md
