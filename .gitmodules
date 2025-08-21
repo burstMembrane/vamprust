@@ -1,0 +1,3 @@
+[submodule "vamp-plugin-sdk"]
+	path = vamp-plugin-sdk
+	url = https://github.com/vamp-plugins/vamp-plugin-sdk.git
