@@ -292,7 +292,7 @@ fn process_fft_frame(
 fn main() {
     // Initialize env_logger - users can set RUST_LOG=debug for verbose output
     env_logger::init();
-    
+
     let args: Vec<String> = env::args().collect();
     let prog_name = &args[0];
 
@@ -398,7 +398,9 @@ fn main() {
     } else {
         None
     };
-
+    if output_file.is_some() {
+        eprintln!("Writing output to file: {}", output_file.clone().unwrap());
+    }
     // Create output writer
     let mut output_writer: Box<dyn Write> = if let Some(filename) = output_file {
         Box::new(File::create(filename).unwrap_or_else(|e| {
@@ -775,9 +777,11 @@ fn main() {
         // Process this chunk
         if let Some(features_ptr) = plugin.process(&buffer_refs, timestamp_sec, timestamp_nsec) {
             unsafe {
-                let features = &*features_ptr;
+                // VampFeatureList* is actually an array, one element per plugin output
+                let features = &*features_ptr.add(target_output_index);
 
                 // Print features similar to vamp-simple-host
+                debug!("Received {} features from process()", features.featureCount);
                 if features.featureCount > 0 && !features.features.is_null() {
                     for i in 0..features.featureCount {
                         let feature = &(*features.features.add(i as usize)).v1;
@@ -790,27 +794,57 @@ fn main() {
                             if feature.hasTimestamp != 0 {
                                 let feat_samples = (feature.sec as f64 * sample_rate as f64)
                                     + (feature.nsec as f64 * sample_rate as f64 / 1_000_000_000.0);
-                                write!(output_writer, "{:.0}: ", feat_samples).unwrap();
+                                write!(output_writer, "{:.0}", feat_samples).unwrap();
                             } else {
-                                write!(output_writer, "{}: ", time_samples).unwrap();
+                                write!(output_writer, "{}", time_samples).unwrap();
                             }
+
+                            // For API version 2, duration features are stored at index featureCount + i
+                            if (features.featureCount * 2) > (features.featureCount + i) {
+                                let feature_v2 =
+                                    &(*features.features.add((features.featureCount + i) as usize))
+                                        .v2;
+                                if feature_v2.hasDuration != 0 {
+                                    let duration_samples = (feature_v2.durationSec as f64
+                                        * sample_rate as f64)
+                                        + (feature_v2.durationNsec as f64 * sample_rate as f64
+                                            / 1_000_000_000.0);
+                                    write!(output_writer, ", {:.0}", duration_samples).unwrap();
+                                }
+                            }
+                            write!(output_writer, ": ").unwrap();
                         } else {
                             if feature.hasTimestamp != 0 {
                                 let feat_time =
                                     feature.sec as f64 + (feature.nsec as f64 / 1_000_000_000.0);
-                                write!(output_writer, "{:.6}: ", feat_time).unwrap();
+                                write!(output_writer, "{:.9}", feat_time).unwrap();
                             } else {
-                                write!(output_writer, "{:.6}: ", time_sec).unwrap();
+                                write!(output_writer, "{:.6}", time_sec).unwrap();
                             }
+
+                            // For API version 2, duration features are stored at index featureCount + i
+                            if (features.featureCount * 2) > (features.featureCount + i) {
+                                let feature_v2 =
+                                    &(*features.features.add((features.featureCount + i) as usize))
+                                        .v2;
+                                if feature_v2.hasDuration != 0 {
+                                    let duration_time = feature_v2.durationSec as f64
+                                        + (feature_v2.durationNsec as f64 / 1_000_000_000.0);
+                                    write!(output_writer, ", {:.9}", duration_time).unwrap();
+                                }
+                            }
+                            write!(output_writer, ": ").unwrap();
                         }
 
                         // Print values
                         if feature.valueCount > 0 && !feature.values.is_null() {
                             for j in 0..feature.valueCount {
                                 let value = *feature.values.add(j as usize);
-                                write!(output_writer, "{:.6}", value).unwrap();
-                                if j < feature.valueCount - 1 {
-                                    write!(output_writer, " ").unwrap();
+                                // Format like C++ cout - no trailing zeros for integers
+                                if value.fract() == 0.0 {
+                                    write!(output_writer, " {}", value as i32).unwrap();
+                                } else {
+                                    write!(output_writer, " {}", value).unwrap();
                                 }
                             }
                         }
@@ -843,11 +877,12 @@ fn main() {
     // Get remaining features
     if let Some(remaining_ptr) = plugin.get_remaining_features() {
         unsafe {
-            let remaining = &*remaining_ptr;
+            // VampFeatureList* is actually an array, one element per plugin output
+            let remaining = &*remaining_ptr.add(target_output_index);
             if remaining.featureCount > 0 && !remaining.features.is_null() {
                 for i in 0..remaining.featureCount {
                     let feature = &(*remaining.features.add(i as usize)).v1;
-                    let label_str = if !feature.label.is_null() {
+                    let _label_str = if !feature.label.is_null() {
                         CStr::from_ptr(feature.label).to_string_lossy().into_owned()
                     } else {
                         "No label".to_string()
@@ -858,23 +893,55 @@ fn main() {
                         if feature.hasTimestamp != 0 {
                             let feat_samples = (feature.sec as f64 * sample_rate as f64)
                                 + (feature.nsec as f64 * sample_rate as f64 / 1_000_000_000.0);
-                            write!(output_writer, "{:.0}: ", feat_samples).unwrap();
+                            write!(output_writer, "{:.0}", feat_samples).unwrap();
                         }
+
+                        // For API version 2, duration features are stored at index featureCount + i
+                        if (remaining.featureCount * 2) > (remaining.featureCount + i) {
+                            let feature_v2 = &(*remaining
+                                .features
+                                .add((remaining.featureCount + i) as usize))
+                            .v2;
+                            if feature_v2.hasDuration != 0 {
+                                let duration_samples = (feature_v2.durationSec as f64
+                                    * sample_rate as f64)
+                                    + (feature_v2.durationNsec as f64 * sample_rate as f64
+                                        / 1_000_000_000.0);
+                                write!(output_writer, ", {:.0}", duration_samples).unwrap();
+                            }
+                        }
+                        write!(output_writer, ": ").unwrap();
                     } else {
                         if feature.hasTimestamp != 0 {
                             let feat_time =
                                 feature.sec as f64 + (feature.nsec as f64 / 1_000_000_000.0);
-                            write!(output_writer, "{:.6}: ", feat_time).unwrap();
+                            write!(output_writer, "{:.9}", feat_time).unwrap();
                         }
+
+                        // For API version 2, duration features are stored at index featureCount + i
+                        if (remaining.featureCount * 2) > (remaining.featureCount + i) {
+                            let feature_v2 = &(*remaining
+                                .features
+                                .add((remaining.featureCount + i) as usize))
+                            .v2;
+                            if feature_v2.hasDuration != 0 {
+                                let duration_time = feature_v2.durationSec as f64
+                                    + (feature_v2.durationNsec as f64 / 1_000_000_000.0);
+                                write!(output_writer, ", {:.9}", duration_time).unwrap();
+                            }
+                        }
+                        write!(output_writer, ": ").unwrap();
                     }
 
                     // Print values
                     if feature.valueCount > 0 && !feature.values.is_null() {
                         for j in 0..feature.valueCount {
                             let value = *feature.values.add(j as usize);
-                            write!(output_writer, "{:.6}", value).unwrap();
-                            if j < feature.valueCount - 1 {
-                                write!(output_writer, " ").unwrap();
+                            // Format like C++ cout - no trailing zeros for integers
+                            if value.fract() == 0.0 {
+                                write!(output_writer, " {}", value as i32).unwrap();
+                            } else {
+                                write!(output_writer, " {}", value).unwrap();
                             }
                         }
                     }

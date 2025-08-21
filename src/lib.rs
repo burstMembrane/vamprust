@@ -1,7 +1,7 @@
-use libc::{c_char, c_int, c_uint, c_void, dlclose, dlopen, dlsym, RTLD_LAZY};
-use std::ffi::{CStr, CString, OsStr};
+use libc::{c_uint, c_void, dlclose, dlopen, dlsym, RTLD_LAZY};
+use std::ffi::{CStr, CString};
 use std::path::{Path, PathBuf};
-use std::{env, fs, ptr};
+use std::{env, fs};
 
 mod ffi {
     #![allow(non_upper_case_globals)]
