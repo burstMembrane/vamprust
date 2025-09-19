@@ -13,3 +13,7 @@ nnls-chroma-1.1
 benchmark
 
 benchmarks
+
+.vscode
+
+.DS_Store

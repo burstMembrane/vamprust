@@ -3,6 +3,9 @@ use std::ffi::{CStr, CString};
 use std::path::{Path, PathBuf};
 use std::{env, fs};
 
+#[cfg(feature = "python")]
+pub mod python;
+
 mod ffi {
     #![allow(non_upper_case_globals)]
     #![allow(non_camel_case_types)]
@@ -13,6 +16,7 @@ mod ffi {
 
 pub use ffi::*;
 
+#[derive(Clone)]
 pub struct VampHost {
     pub plugin_paths: Vec<PathBuf>,
 }
@@ -314,6 +318,31 @@ impl VampPlugin {
             }
         }
     }
+
+    pub fn set_parameter(&mut self, parameter: u32, value: f32) -> bool {
+        unsafe {
+            if let Some(set_parameter) = (*self.descriptor).setParameter {
+                set_parameter(self.handle, parameter as i32, value);
+                true
+            } else {
+                false
+            }
+        }
+    }
+
+    pub fn get_parameter(&self, parameter: u32) -> Option<f32> {
+        unsafe {
+            if let Some(get_parameter) = (*self.descriptor).getParameter {
+                Some(get_parameter(self.handle, parameter as i32))
+            } else {
+                None
+            }
+        }
+    }
+
+    pub fn get_parameter_count(&self) -> u32 {
+        unsafe { (*self.descriptor).parameterCount }
+    }
 }
 
 impl Drop for VampPlugin {
@@ -366,7 +395,7 @@ mod tests {
             if let Some(library) = host.load_library(first_lib) {
                 let plugins = library.list_plugins();
                 if let Some(first_plugin) = plugins.first() {
-                    if let Some(plugin) = library.instantiate_plugin(first_plugin.index, 44100.0) {
+                    if let Some(_plugin) = library.instantiate_plugin(first_plugin.index, 44100.0) {
                         println!(
                             "Successfully instantiated plugin: {}",
                             first_plugin.identifier

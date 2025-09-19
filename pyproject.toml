@@ -1,0 +1,73 @@
+
+
+[project]
+name = "vamprust"
+version = "0.2.1"
+description = "Python bindings for VampRust - Rust wrapper for the Vamp Plugin SDK"
+authors = [{ name = "VampRust Contributors" }]
+license = { text = "BSD-3-Clause" }
+readme = "README.md"
+requires-python = ">=3.8"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: BSD License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Rust",
+    "Topic :: Multimedia :: Sound/Audio :: Analysis",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+]
+dependencies = [
+    "maturin>=1.9.4",
+    "numpy>=1.20.0",
+ "rapidfuzz>=3.9.7",
+ "soundfile>=0.13.1",
+]
+
+[tool.mypy]
+python_version = "3.12"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+disallow_untyped_defs = true
+exclude = "test_*"
+[project.optional-dependencies]
+dev = ["pytest>=7.0.0", "pytest-benchmark", "maturin[patchelf]"]
+audio = ["soundfile>=0.12.0", "librosa>=0.10.0"]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/vamprust"
+Repository = "https://github.com/yourusername/vamprust.git"
+Issues = "https://github.com/yourusername/vamprust/issues"
+
+[tool.maturin]
+features = ["python"]
+module-name = "vamprust._vamprust"
+python-source = "python"
+
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[tool.pytest.ini_options]
+testpaths = ["python/tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+
+
+[project.scripts]
+vamprust-cli = "vamprust.cli:main"
+
+[dependency-groups]
+audio = ["soxr>=0.3.7"]
+csv = ["pandas>=1.5.0"]
+dev = ["ipykernel>=6.29.5", "line-profiler>=5.0.0"]
