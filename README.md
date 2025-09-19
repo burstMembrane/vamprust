@@ -171,9 +171,9 @@ This wrapper uses:
 
 ## Platform Support
 
-- ✅ macOS (Intel/ARM - requires cmake and Xcode tools)
-- ✅ Linux (tested on Ubuntu/Debian - requires cmake and build-essential)
-- ❓ Windows (should work with MSVC but untested)
+-  macOS (Intel/ARM - requires cmake and Xcode tools)
+-  Linux (tested on Ubuntu/Debian - requires cmake and build-essential)
+-  Windows (should work with MSVC but untested)
 
 ## License
 
