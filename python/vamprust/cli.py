@@ -24,6 +24,10 @@ def load_audio(filepath: str) -> tuple[np.ndarray, float]:
         # Convert to mono if stereo
         if len(data.shape) > 1:
             data = np.mean(data, axis=1)
+
+        # ensure c contiguous float32 array
+        if not data.flags["C_CONTIGUOUS"] or data.dtype != np.float32:
+            data = np.ascontiguousarray(data, dtype=np.float32)
         return data.astype(np.float32), float(sample_rate)
     except Exception as e:
         raise RuntimeError(f"Failed to load audio file '{filepath}': {e}")

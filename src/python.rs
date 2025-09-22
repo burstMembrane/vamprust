@@ -342,7 +342,7 @@ pub struct PyVampPlugin {
     block_size: Option<usize>,
     step_size: Option<usize>,
     // FFT caching
-    fft_plan: Option<std::sync::Arc<dyn realfft::RealToComplex<f32>>>,
+    fft_plan: Option<std::sync::Arc<dyn realfft::RealToComplex<f32> + Send + Sync>>,
     fft_input_buf: Option<Vec<f32>>,
     fft_output_buf: Option<Vec<rustfft::num_complex::Complex<f32>>>,
     fft_scratch: Option<Vec<rustfft::num_complex::Complex<f32>>>,
@@ -355,6 +355,58 @@ fn make_hann_window(n: usize) -> Vec<f32> {
     let n_f = n as f32;
     (0..n)
         .map(|i| 0.5 * (1.0 - (2.0 * std::f32::consts::PI * (i as f32) / n_f).cos()))
+        .collect()
+}
+
+/// Parallel FFT computation for a batch of audio frames
+/// Computes multiple spectra in parallel, each worker gets its own buffers
+fn parallel_ffts_interleaved(
+    plan: std::sync::Arc<dyn realfft::RealToComplex<f32> + Send + Sync>,
+    hann: std::sync::Arc<[f32]>,
+    mono: &[f32],
+    starts: &[usize],
+    block_size: usize,
+) -> Vec<Vec<f32>> {
+    use rayon::prelude::*;
+
+    starts
+        .par_iter()
+        .map_init(
+            || {
+                // Per-thread buffers - each worker allocates once
+                let mut input = plan.make_input_vec();
+                let mut output = plan.make_output_vec();
+                let mut scratch = plan.make_scratch_vec();
+                let interleaved_len = output.len() * 2;
+                let inter = vec![0.0f32; interleaved_len];
+                (input, output, scratch, inter)
+            },
+            |(input, output, scratch, inter), &start| {
+                // Tight copy + window; zero-pad tail if short
+                let end = (start + block_size).min(mono.len());
+                let got = end - start;
+
+                input[..got].copy_from_slice(&mono[start..end]);
+                if got < block_size {
+                    input[got..].fill(0.0);
+                }
+
+                // Apply Hann window in-place
+                apply_hann_inplace(&mut input[..block_size], &hann[..block_size]);
+
+                // Perform FFT
+                let _ = plan.process_with_scratch(input, output, scratch);
+
+                // Deinterleave complex -> [re0,im0,re1,im1,...]
+                for (k, c) in output.iter().enumerate() {
+                    let i = k << 1; // k * 2
+                    inter[i] = c.re;
+                    inter[i + 1] = c.im;
+                }
+
+                std::mem::take(inter) // moves the Vec out; next call allocates a fresh one
+            },
+        )
         .collect()
 }
 
@@ -410,204 +462,269 @@ impl PyVampPlugin {
         let block_size = self.block_size.unwrap();
         let step_size = self.step_size.unwrap();
         let input_domain = self.plugin.get_input_domain();
-        let processing_channels = 1; // Always force mono
-
-        // Set up FFT if needed
-        if input_domain == crate::InputDomain::FrequencyDomain {
-            self.ensure_fft_cache(block_size);
-        }
 
         let mut all_features = Vec::new();
-        let mut timestamp_samples = 0i64;
-        let mut sample_index = 0;
-        let mut current_step = 0;
 
-        // Calculate overlap size
-        let overlap_size = block_size - step_size;
+        // Handle frequency domain with parallel FFT batching
+        if input_domain == crate::InputDomain::FrequencyDomain {
+            self.ensure_fft_cache(block_size);
 
-        // Pre-allocate audio buffers
-        let mut audio_buffer: Vec<Vec<f32>> = vec![vec![0.0; block_size]; processing_channels];
+            // Get shared FFT plan and window
+            let plan = self.fft_plan.as_ref().unwrap().clone();
+            let hann: std::sync::Arc<[f32]> =
+                std::sync::Arc::from(self.hann_window.as_ref().unwrap().clone());
 
-        let mut final_steps_remaining = if block_size > step_size {
-            (block_size / step_size).max(1)
-        } else {
-            1
-        };
-
-        // Main processing loop (no GIL held here!)
-        while final_steps_remaining > 0 {
-            let frames_to_read = if (block_size == step_size) || (current_step == 0) {
-                block_size
-            } else {
-                // Move existing data down
-                for ch in 0..processing_channels {
-                    audio_buffer[ch].copy_within(step_size..block_size, 0);
+            // Convert audio to mono buffer first
+            let mono_buf = if channels == 1 {
+                audio_samples
+            } else if channels == 2 {
+                // Stereo to mono: mix L+R channels
+                let mut mono = Vec::with_capacity(audio_samples.len() / 2);
+                for chunk in audio_samples.chunks_exact(2) {
+                    mono.push((chunk[0] + chunk[1]) / 2.0);
                 }
-                step_size
-            };
-
-            let mut frames_read = 0;
-            let start_pos = if (block_size == step_size) || (current_step == 0) {
-                0
+                mono
             } else {
-                overlap_size
+                // Multi-channel: just take first channel
+                let mut mono = Vec::with_capacity(audio_samples.len() / channels);
+                for chunk in audio_samples.chunks_exact(channels) {
+                    mono.push(chunk[0]);
+                }
+                mono
             };
 
-            // Read frames from input, handling stereo to mono conversion
-            for frame in 0..frames_to_read {
-                let frame_start = sample_index + frame * channels;
-                if frame_start >= audio_samples.len() {
+            // Precompute all step starts with proper overlap pattern
+            let mut starts = Vec::new();
+            let mut s = 0usize;
+            while s + 1 < mono_buf.len() {  // allow zero-pad tail
+                starts.push(s);
+                if s + step_size >= mono_buf.len() {  // we'll zero-pad inside FFT
                     break;
                 }
-
-                for ch in 0..processing_channels {
-                    let buffer_pos = start_pos + frame;
-                    if processing_channels == 1 && channels == 2 {
-                        // Stereo to mono: mix L+R channels
-                        let left_idx = frame_start;
-                        let right_idx = frame_start + 1;
-                        audio_buffer[0][buffer_pos] = if right_idx < audio_samples.len() {
-                            (audio_samples[left_idx] + audio_samples[right_idx]) / 2.0
-                        } else {
-                            audio_samples[left_idx]
-                        };
-                    } else {
-                        // Direct copy
-                        let idx = frame_start + ch;
-                        audio_buffer[ch][buffer_pos] = if idx < audio_samples.len() {
-                            audio_samples[idx]
-                        } else {
-                            0.0
-                        };
-                    }
-                }
-                frames_read += 1;
+                s += step_size;
+            }
+            // Ensure at least one window
+            if starts.is_empty() { 
+                starts.push(0); 
             }
 
-            if frames_read != frames_to_read {
-                // Pad with zeros and decrease remaining steps
-                final_steps_remaining -= 1;
-                for ch in 0..processing_channels {
-                    for i in (start_pos + frames_read)..(start_pos + frames_to_read) {
-                        if i < audio_buffer[ch].len() {
-                            audio_buffer[ch][i] = 0.0;
-                        }
-                    }
-                }
-            }
+            // Batch size for controlling memory usage
+            let batch = std::cmp::max(16, rayon::current_num_threads());
 
-            // Process based on input domain
-            let buffer_refs: Vec<&[f32]> = if input_domain == crate::InputDomain::FrequencyDomain {
-                // Fast FFT path with cached buffers - release GIL for this heavy work
-                if let (
-                    Some(ref plan),
-                    Some(ref mut input_buf),
-                    Some(ref mut output_buf),
-                    Some(ref mut scratch),
-                    Some(ref mut interleaved),
-                    Some(ref hann),
-                ) = (
-                    &self.fft_plan,
-                    &mut self.fft_input_buf,
-                    &mut self.fft_output_buf,
-                    &mut self.fft_scratch,
-                    &mut self.fft_interleaved,
-                    &self.hann_window,
-                ) {
-                    // Release GIL for heavy FFT computation
-                    Python::with_gil(|py| {
-                        py.allow_threads(|| {
-                            // Copy data and apply window in one pass
-                            let copy_len = audio_buffer[0].len().min(input_buf.len());
-                            for i in 0..copy_len {
-                                input_buf[i] = audio_buffer[0][i] * hann[i];
-                            }
-                            if copy_len < input_buf.len() {
-                                input_buf[copy_len..].fill(0.0);
-                            }
+            // Process in batches: FFTs in parallel, plugin sequentially
+            let mut idx = 0usize;
+            while idx < starts.len() {
+                let end = (idx + batch).min(starts.len());
+                let batch_starts = &starts[idx..end];
 
-                            // Perform FFT with scratch buffer
-                            if plan
-                                .process_with_scratch(input_buf, output_buf, scratch)
-                                .is_ok()
-                            {
-                                // Fast interleaved conversion without allocation
-                                for (k, c) in output_buf.iter().enumerate() {
-                                    let i = k << 1; // k * 2
-                                    interleaved[i] = c.re;
-                                    interleaved[i + 1] = c.im;
+                // Release GIL around heavy parallel section
+                let spectra = Python::with_gil(|py| {
+                    py.allow_threads(|| {
+                        parallel_ffts_interleaved(
+                            plan.clone(),
+                            hann.clone(),
+                            &mono_buf,
+                            batch_starts,
+                            block_size,
+                        )
+                    })
+                });
+
+                // Now sequentially call plugin.process(...) per spectrum
+                for (j, inter) in spectra.into_iter().enumerate() {
+                    // Calculate timestamp for this frame
+                    let start_samples = batch_starts[j] as i64;
+                    let ts_sec = (start_samples as f64 / sample_rate as f64) as i32;
+                    let ts_nsec = (((start_samples as f64 / sample_rate as f64) % 1.0)
+                        * 1_000_000_000.0) as i32;
+
+                    let buffer_refs: Vec<&[f32]> = vec![inter.as_slice()];
+
+                    if let Some(features_ptr) = self.plugin.process(&buffer_refs, ts_sec, ts_nsec) {
+                        unsafe {
+                            let target_output_index = output_index.unwrap_or(0);
+                            let features = &*features_ptr.add(target_output_index);
+                            if features.featureCount > 0 && !features.features.is_null() {
+                                for i in 0..features.featureCount {
+                                    let feature = &(*features.features.add(i as usize)).v1;
+                                    let values =
+                                        if feature.valueCount > 0 && !feature.values.is_null() {
+                                            std::slice::from_raw_parts(
+                                                feature.values,
+                                                feature.valueCount as usize,
+                                            )
+                                            .to_vec()
+                                        } else {
+                                            Vec::new()
+                                        };
+                                    let label = if !feature.label.is_null() {
+                                        std::ffi::CStr::from_ptr(feature.label)
+                                            .to_string_lossy()
+                                            .into_owned()
+                                    } else {
+                                        String::new()
+                                    };
+
+                                    all_features.push(SimpleFeature {
+                                        has_timestamp: feature.hasTimestamp != 0,
+                                        sec: feature.sec,
+                                        nsec: feature.nsec,
+                                        values,
+                                        label,
+                                    });
                                 }
                             }
-                        })
-                    });
-
-                    vec![interleaved.as_slice()]
-                } else {
-                    vec![audio_buffer[0].as_slice()]
-                }
-            } else {
-                // Time domain - use audio buffers directly
-                audio_buffer.iter().map(|v| v.as_slice()).collect()
-            };
-
-            // Calculate timestamp
-            let timestamp_sec = (timestamp_samples as f64 / sample_rate as f64) as i32;
-            let timestamp_nsec =
-                (((timestamp_samples as f64 / sample_rate as f64) % 1.0) * 1_000_000_000.0) as i32;
-
-            // Process this chunk
-            if let Some(features_ptr) =
-                self.plugin
-                    .process(&buffer_refs, timestamp_sec, timestamp_nsec)
-            {
-                unsafe {
-                    let target_output_index = output_index.unwrap_or(0);
-                    let features = &*features_ptr.add(target_output_index);
-
-                    if features.featureCount > 0 && !features.features.is_null() {
-                        for i in 0..features.featureCount {
-                            let feature = &(*features.features.add(i as usize)).v1;
-
-                            // Extract values
-                            let values = if feature.valueCount > 0 && !feature.values.is_null() {
-                                std::slice::from_raw_parts(
-                                    feature.values,
-                                    feature.valueCount as usize,
-                                )
-                                .to_vec()
-                            } else {
-                                Vec::new()
-                            };
-
-                            // Extract label
-                            let label = if !feature.label.is_null() {
-                                std::ffi::CStr::from_ptr(feature.label)
-                                    .to_string_lossy()
-                                    .into_owned()
-                            } else {
-                                String::new()
-                            };
-
-                            all_features.push(SimpleFeature {
-                                has_timestamp: feature.hasTimestamp != 0,
-                                sec: feature.sec,
-                                nsec: feature.nsec,
-                                values,
-                                label,
-                            });
+                            self.plugin.release_feature_set(features_ptr);
                         }
                     }
-
-                    self.plugin.release_feature_set(features_ptr);
                 }
+
+                idx = end;
             }
+        } else {
+            // Time domain processing - keep existing frame-by-frame approach
+            let processing_channels = 1; // Always force mono
+            let mut timestamp_samples = 0i64;
+            let mut sample_index = 0;
+            let mut current_step = 0;
 
-            // Update sample position and step counter
-            sample_index += frames_to_read * channels;
-            current_step += 1;
+            // Calculate overlap size
+            let overlap_size = block_size - step_size;
 
-            // Update timestamp for next iteration
-            timestamp_samples += step_size as i64;
+            // Pre-allocate audio buffers
+            let mut audio_buffer: Vec<Vec<f32>> = vec![vec![0.0; block_size]; processing_channels];
+
+            let mut final_steps_remaining = if block_size > step_size {
+                (block_size / step_size).max(1)
+            } else {
+                1
+            };
+
+            // Main processing loop for time domain
+            while final_steps_remaining > 0 {
+                let frames_to_read = if (block_size == step_size) || (current_step == 0) {
+                    block_size
+                } else {
+                    // Move existing data down
+                    for ch in 0..processing_channels {
+                        audio_buffer[ch].copy_within(step_size..block_size, 0);
+                    }
+                    step_size
+                };
+
+                let mut frames_read = 0;
+                let start_pos = if (block_size == step_size) || (current_step == 0) {
+                    0
+                } else {
+                    overlap_size
+                };
+
+                // Read frames from input, handling stereo to mono conversion
+                for frame in 0..frames_to_read {
+                    let frame_start = sample_index + frame * channels;
+                    if frame_start >= audio_samples.len() {
+                        break;
+                    }
+
+                    for ch in 0..processing_channels {
+                        let buffer_pos = start_pos + frame;
+                        if processing_channels == 1 && channels == 2 {
+                            // Stereo to mono: mix L+R channels
+                            let left_idx = frame_start;
+                            let right_idx = frame_start + 1;
+                            audio_buffer[0][buffer_pos] = if right_idx < audio_samples.len() {
+                                (audio_samples[left_idx] + audio_samples[right_idx]) / 2.0
+                            } else {
+                                audio_samples[left_idx]
+                            };
+                        } else {
+                            // Direct copy
+                            let idx = frame_start + ch;
+                            audio_buffer[ch][buffer_pos] = if idx < audio_samples.len() {
+                                audio_samples[idx]
+                            } else {
+                                0.0
+                            };
+                        }
+                    }
+                    frames_read += 1;
+                }
+
+                if frames_read != frames_to_read {
+                    // Pad with zeros and decrease remaining steps
+                    final_steps_remaining -= 1;
+                    for ch in 0..processing_channels {
+                        for i in (start_pos + frames_read)..(start_pos + frames_to_read) {
+                            if i < audio_buffer[ch].len() {
+                                audio_buffer[ch][i] = 0.0;
+                            }
+                        }
+                    }
+                }
+
+                // Use audio buffers directly for time domain
+                let buffer_refs: Vec<&[f32]> = audio_buffer.iter().map(|v| v.as_slice()).collect();
+
+                // Calculate timestamp
+                let timestamp_sec = (timestamp_samples as f64 / sample_rate as f64) as i32;
+                let timestamp_nsec = (((timestamp_samples as f64 / sample_rate as f64) % 1.0)
+                    * 1_000_000_000.0) as i32;
+
+                // Process this chunk
+                if let Some(features_ptr) =
+                    self.plugin
+                        .process(&buffer_refs, timestamp_sec, timestamp_nsec)
+                {
+                    unsafe {
+                        let target_output_index = output_index.unwrap_or(0);
+                        let features = &*features_ptr.add(target_output_index);
+
+                        if features.featureCount > 0 && !features.features.is_null() {
+                            for i in 0..features.featureCount {
+                                let feature = &(*features.features.add(i as usize)).v1;
+
+                                // Extract values
+                                let values = if feature.valueCount > 0 && !feature.values.is_null()
+                                {
+                                    std::slice::from_raw_parts(
+                                        feature.values,
+                                        feature.valueCount as usize,
+                                    )
+                                    .to_vec()
+                                } else {
+                                    Vec::new()
+                                };
+
+                                // Extract label
+                                let label = if !feature.label.is_null() {
+                                    std::ffi::CStr::from_ptr(feature.label)
+                                        .to_string_lossy()
+                                        .into_owned()
+                                } else {
+                                    String::new()
+                                };
+
+                                all_features.push(SimpleFeature {
+                                    has_timestamp: feature.hasTimestamp != 0,
+                                    sec: feature.sec,
+                                    nsec: feature.nsec,
+                                    values,
+                                    label,
+                                });
+                            }
+                        }
+
+                        self.plugin.release_feature_set(features_ptr);
+                    }
+                }
+
+                // Update sample position and step counter
+                sample_index += frames_to_read * channels;
+                current_step += 1;
+
+                // Update timestamp for next iteration
+                timestamp_samples += step_size as i64;
+            }
         }
 
         // Get remaining features

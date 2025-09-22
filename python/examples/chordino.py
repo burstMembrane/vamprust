@@ -37,20 +37,37 @@ Chord extractor parameters:
 
 """
 
-import json
+from argparse import ArgumentParser
 from pathlib import Path
+from typing import Any, List
 
 from vamprust.audio import AudioProcessor, load_audio
 
 
+def print_chords(features: List[dict[str, Any]]) -> None:
+    for feature in features:
+        timestamp = feature["sec"] + feature["nsec"] / 1e9
+        chord = feature["label"]
+        print(f"{timestamp:.2f}s: {chord}")
+
+
 def main() -> None:
-    AUDIO_PATH = Path(__file__).parent.parent.parent / "mix.wav"
-    audio, sr = load_audio(AUDIO_PATH, sample_rate=16000)
+    parser = ArgumentParser(description="Extract chords using Chordino Vamp plugin")
+    parser.add_argument(
+        "audio_file", type=Path, help="Path to input audio file (e.g., WAV, MP3)"
+    )
+    args = parser.parse_args()
+    if not args.audio_file.exists():
+        print(f"Audio file '{args.audio_file}' does not exist")
+        return
+
+    AUDIO_PATH = Path(args.audio_file)
+    audio, sr = load_audio(AUDIO_PATH, sample_rate=44100)
     print(
         f"Loaded audio from {AUDIO_PATH}, sample rate: {sr}, length: {len(audio)} samples"
     )
 
-    features = AudioProcessor().process_audio(
+    AudioProcessor().process_audio(
         "chordino",
         audio,
         sample_rate=sr,
@@ -64,10 +81,6 @@ def main() -> None:
             "boostn": 0.1,
         },
     )
-    print(f"Extracted {len(features)} features")
-    # save to json
-    with open(f"{AUDIO_PATH.stem}_chords.json", "w") as f:
-        json.dump(features, f, indent=2)
 
 
 if __name__ == "__main__":

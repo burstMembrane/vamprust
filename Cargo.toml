@@ -17,6 +17,7 @@ libc = "0.2"
 sndfile = "0.1.1"
 realfft = { version = "3.4", features = ["avx"] }
 rustfft = "6.4.0"
+rayon = "1"
 env_logger = { version = "0.11.8", default-features = false, features = ["color"] }
 log = "0.4"
 pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
