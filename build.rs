@@ -96,8 +96,13 @@ fn configure_submodule_build(submodule_path: &Path) {
     {
         println!("cargo:rustc-link-lib=static=vamp-hostsdk");
         println!("cargo:rustc-link-lib=static=vamp-sdk");
+        // Use stdc++ for better compatibility on Linux
         println!("cargo:rustc-link-lib=stdc++");
         println!("cargo:rustc-link-lib=dl");
+        // Add pthread for thread safety
+        println!("cargo:rustc-link-lib=pthread");
+        // Add math library
+        println!("cargo:rustc-link-lib=m");
     }
 
     // Rerun if submodule changes
@@ -141,8 +146,13 @@ fn configure_system_build() {
         {
             println!("cargo:rustc-link-lib=vamp-hostsdk");
             println!("cargo:rustc-link-lib=vamp-sdk");
+            // Use stdc++ for better compatibility on Linux
             println!("cargo:rustc-link-lib=stdc++");
             println!("cargo:rustc-link-lib=dl");
+            // Add pthread for thread safety
+            println!("cargo:rustc-link-lib=pthread");
+            // Add math library
+            println!("cargo:rustc-link-lib=m");
         }
     }
 }

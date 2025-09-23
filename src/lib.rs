@@ -100,14 +100,36 @@ type VampGetPluginDescriptorFn = extern "C" fn(c_uint, c_uint) -> *const VampPlu
 impl VampLibrary {
     pub fn load<P: AsRef<Path>>(library_path: P) -> Option<Self> {
         let path = library_path.as_ref();
-        let path_cstr = CString::new(path.to_str()?).ok()?;
+        log::debug!("VampLibrary: Attempting to load library: {}", path.display());
+        
+        let path_cstr = match CString::new(path.to_str()?) {
+            Ok(cstr) => cstr,
+            Err(e) => {
+                log::error!("VampLibrary: Failed to create CString for path '{}': {}", path.display(), e);
+                return None;
+            }
+        };
 
         unsafe {
             let handle = dlopen(path_cstr.as_ptr(), RTLD_LAZY);
             if handle.is_null() {
+                #[cfg(unix)]
+                {
+                    use std::ffi::CStr;
+                    let error_msg = libc::dlerror();
+                    if !error_msg.is_null() {
+                        let error_str = CStr::from_ptr(error_msg).to_string_lossy();
+                        log::error!("VampLibrary: dlopen failed for '{}': {}", path.display(), error_str);
+                    } else {
+                        log::error!("VampLibrary: dlopen failed for '{}': unknown error", path.display());
+                    }
+                }
+                #[cfg(not(unix))]
+                log::error!("VampLibrary: Failed to load library: {}", path.display());
                 return None;
             }
 
+            log::debug!("VampLibrary: Successfully loaded library: {}", path.display());
             Some(VampLibrary {
                 handle,
                 path: path.to_path_buf(),
@@ -120,8 +142,20 @@ impl VampLibrary {
             let symbol_name = CString::new("vampGetPluginDescriptor").ok()?;
             let symbol = dlsym(self.handle, symbol_name.as_ptr());
             if symbol.is_null() {
+                #[cfg(unix)]
+                {
+                    use std::ffi::CStr;
+                    let error_msg = libc::dlerror();
+                    if !error_msg.is_null() {
+                        let error_str = CStr::from_ptr(error_msg).to_string_lossy();
+                        log::error!("VampLibrary: dlsym failed for 'vampGetPluginDescriptor' in '{}': {}", self.path.display(), error_str);
+                    } else {
+                        log::error!("VampLibrary: dlsym failed for 'vampGetPluginDescriptor' in '{}': symbol not found", self.path.display());
+                    }
+                }
                 return None;
             }
+            log::debug!("VampLibrary: Found vampGetPluginDescriptor symbol in '{}'", self.path.display());
             Some(std::mem::transmute::<*mut c_void, VampGetPluginDescriptorFn>(symbol))
         }
     }
@@ -173,19 +207,30 @@ impl VampLibrary {
     }
 
     pub fn instantiate_plugin(&self, plugin_index: usize, sample_rate: f32) -> Option<VampPlugin> {
+        log::debug!("VampLibrary: Attempting to instantiate plugin at index {} with sample rate {}", plugin_index, sample_rate);
+        
         if let Some(desc) = self.get_plugin_descriptor(plugin_index) {
+            log::debug!("VampLibrary: Got plugin descriptor for index {}", plugin_index);
             unsafe {
                 if let Some(instantiate) = desc.instantiate {
+                    log::debug!("VampLibrary: Calling instantiate function for plugin at index {}", plugin_index);
                     let handle = instantiate(desc, sample_rate);
                     if !handle.is_null() {
+                        log::debug!("VampLibrary: Successfully instantiated plugin at index {}", plugin_index);
                         return Some(VampPlugin {
                             handle,
                             descriptor: desc,
                             sample_rate,
                         });
+                    } else {
+                        log::error!("VampLibrary: Plugin instantiate function returned null handle for index {}", plugin_index);
                     }
+                } else {
+                    log::error!("VampLibrary: Plugin descriptor has no instantiate function for index {}", plugin_index);
                 }
             }
+        } else {
+            log::error!("VampLibrary: Failed to get plugin descriptor for index {}", plugin_index);
         }
         None
     }

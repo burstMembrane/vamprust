@@ -29,9 +29,16 @@ impl PyVampHost {
     }
 
     fn load_library(&self, library_path: String) -> PyResult<Option<PyVampLibrary>> {
+        log::debug!("PyVampHost: Attempting to load library: {}", library_path);
         match self.host.load_library(&library_path) {
-            Some(library) => Ok(Some(PyVampLibrary { library })),
-            None => Ok(None),
+            Some(library) => {
+                log::debug!("PyVampHost: Successfully loaded library: {}", library_path);
+                Ok(Some(PyVampLibrary { library }))
+            },
+            None => {
+                log::warn!("PyVampHost: Failed to load library: {}", library_path);
+                Ok(None)
+            },
         }
     }
 
@@ -50,34 +57,50 @@ impl PyVampHost {
     ) -> PyResult<Option<PyObject>> {
         // Automatically find and load the plugin, then process audio
         let libraries = self.host.find_plugin_libraries();
+        log::debug!("PyVampHost: Searching for plugin '{}' in {} libraries", plugin_id, libraries.len());
 
         for library_path in libraries {
+            log::debug!("PyVampHost: Checking library: {}", library_path.display());
             if let Some(library) = self.host.load_library(&library_path) {
+                log::debug!("PyVampHost: Successfully loaded library, listing plugins");
                 let plugins = library.list_plugins();
+                log::debug!("PyVampHost: Found {} plugins in library", plugins.len());
 
                 for (index, plugin_info) in plugins.iter().enumerate() {
+                    log::debug!("PyVampHost: Checking plugin {}: '{}'", index, plugin_info.identifier);
                     if plugin_info.identifier == plugin_id {
+                        log::debug!("PyVampHost: Found target plugin '{}' at index {}", plugin_id, index);
                         // Found the plugin! Instantiate and process
                         if let Some(mut plugin) = library.instantiate_plugin(index, sample_rate) {
                             // Initialize the plugin
                             let processing_channels = channels.unwrap_or(1);
 
-                            // Get preferred sizes
+                            // Get preferred sizes - add null checks for safety
                             let preferred_block_size = unsafe {
-                                if let Some(get_preferred_block) =
-                                    (*plugin.descriptor).getPreferredBlockSize
-                                {
-                                    get_preferred_block(plugin.handle)
+                                if !plugin.descriptor.is_null() && 
+                                   (*plugin.descriptor).getPreferredBlockSize.is_some() {
+                                    if let Some(get_preferred_block) =
+                                        (*plugin.descriptor).getPreferredBlockSize
+                                    {
+                                        get_preferred_block(plugin.handle)
+                                    } else {
+                                        1024
+                                    }
                                 } else {
                                     1024
                                 }
                             };
 
                             let preferred_step_size = unsafe {
-                                if let Some(get_preferred_step) =
-                                    (*plugin.descriptor).getPreferredStepSize
-                                {
-                                    get_preferred_step(plugin.handle)
+                                if !plugin.descriptor.is_null() && 
+                                   (*plugin.descriptor).getPreferredStepSize.is_some() {
+                                    if let Some(get_preferred_step) =
+                                        (*plugin.descriptor).getPreferredStepSize
+                                    {
+                                        get_preferred_step(plugin.handle)
+                                    } else {
+                                        preferred_block_size / 2
+                                    }
                                 } else {
                                     preferred_block_size / 2
                                 }
@@ -170,22 +193,32 @@ impl PyVampHost {
                             // Initialize the plugin
                             let processing_channels = channels.unwrap_or(1);
 
-                            // Get preferred sizes
+                            // Get preferred sizes - add null checks for safety
                             let preferred_block_size = unsafe {
-                                if let Some(get_preferred_block) =
-                                    (*plugin.descriptor).getPreferredBlockSize
-                                {
-                                    get_preferred_block(plugin.handle)
+                                if !plugin.descriptor.is_null() && 
+                                   (*plugin.descriptor).getPreferredBlockSize.is_some() {
+                                    if let Some(get_preferred_block) =
+                                        (*plugin.descriptor).getPreferredBlockSize
+                                    {
+                                        get_preferred_block(plugin.handle)
+                                    } else {
+                                        1024
+                                    }
                                 } else {
                                     1024
                                 }
                             };
 
                             let preferred_step_size = unsafe {
-                                if let Some(get_preferred_step) =
-                                    (*plugin.descriptor).getPreferredStepSize
-                                {
-                                    get_preferred_step(plugin.handle)
+                                if !plugin.descriptor.is_null() && 
+                                   (*plugin.descriptor).getPreferredStepSize.is_some() {
+                                    if let Some(get_preferred_step) =
+                                        (*plugin.descriptor).getPreferredStepSize
+                                    {
+                                        get_preferred_step(plugin.handle)
+                                    } else {
+                                        preferred_block_size / 2
+                                    }
                                 } else {
                                     preferred_block_size / 2
                                 }
@@ -964,16 +997,26 @@ impl PyVampPlugin {
 
         // Get preferred block and step sizes from the plugin
         let preferred_block_size = unsafe {
-            if let Some(get_preferred_block) = (*self.plugin.descriptor).getPreferredBlockSize {
-                get_preferred_block(self.plugin.handle)
+            if !self.plugin.descriptor.is_null() && 
+               (*self.plugin.descriptor).getPreferredBlockSize.is_some() {
+                if let Some(get_preferred_block) = (*self.plugin.descriptor).getPreferredBlockSize {
+                    get_preferred_block(self.plugin.handle)
+                } else {
+                    1024
+                }
             } else {
                 1024
             }
         };
 
         let preferred_step_size = unsafe {
-            if let Some(get_preferred_step) = (*self.plugin.descriptor).getPreferredStepSize {
-                get_preferred_step(self.plugin.handle)
+            if !self.plugin.descriptor.is_null() && 
+               (*self.plugin.descriptor).getPreferredStepSize.is_some() {
+                if let Some(get_preferred_step) = (*self.plugin.descriptor).getPreferredStepSize {
+                    get_preferred_step(self.plugin.handle)
+                } else {
+                    preferred_block_size / 2
+                }
             } else {
                 preferred_block_size / 2
             }
@@ -1549,6 +1592,12 @@ impl PyVampPlugin {
     fn __repr__(&self) -> String {
         format!("VampPlugin(sample_rate={})", self.plugin.sample_rate)
     }
+
+    fn __del__(&mut self) {
+        // Explicitly reset the plugin to ensure proper cleanup
+        // This is critical for Linux where C++ destructors may not be called properly
+        self.plugin.reset();
+    }
 }
 
 #[pyclass(eq, eq_int)]
@@ -1597,6 +1646,14 @@ impl std::convert::From<PyVampError> for PyErr {
 
 #[pymodule]
 fn _vamprust(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Initialize env_logger for debugging
+    env_logger::Builder::from_default_env()
+        .filter_level(log::LevelFilter::Debug)
+        .try_init()
+        .ok(); // Ignore if already initialized
+    
+    log::debug!("Initializing vamprust Python module");
+
     m.add_class::<PyVampHost>()?;
     m.add_class::<PyVampLibrary>()?;
     m.add_class::<PyVampPlugin>()?;
@@ -1612,5 +1669,6 @@ fn _vamprust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("InputDomain", m.getattr("PyInputDomain")?)?;
     m.add("VampError", m.getattr("PyVampError")?)?;
 
+    log::debug!("vamprust Python module initialized successfully");
     Ok(())
 }
