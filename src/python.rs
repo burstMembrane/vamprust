@@ -1749,11 +1749,6 @@ fn _vamprust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Initialize env_logger if not already initialized
     // This allows RUST_LOG env var to control debug output
     let _ = env_logger::try_init();
-    // Initialize env_logger for debugging
-    env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Debug)
-        .try_init()
-        .ok(); // Ignore if already initialized
     
     log::debug!("Initializing vamprust Python module");
 
