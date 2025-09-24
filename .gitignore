@@ -12,3 +12,5 @@ BINDINGS.md
 chord-extractor/
 mix.wav
 rt-vamp-plugin-sdk/
+__pycache__/
+*.so

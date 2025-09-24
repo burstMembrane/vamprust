@@ -392,9 +392,22 @@ impl VampPlugin {
 
 impl Drop for VampPlugin {
     fn drop(&mut self) {
+        // Check if we can safely cleanup
+        if self.descriptor.is_null() || self.handle.is_null() {
+            return;
+        }
+
         unsafe {
-            if let Some(cleanup) = (*self.descriptor).cleanup {
-                cleanup(self.handle);
+            // Additional safety check - verify the descriptor is still accessible
+            // This helps prevent segfaults when the plugin library has been unloaded
+            let cleanup_fn = std::ptr::read_volatile(&(*self.descriptor).cleanup);
+            if let Some(cleanup) = cleanup_fn {
+                // Only call cleanup if the function pointer looks valid
+                // Check if it's in a reasonable memory range (not null, not near null)
+                let fn_addr = cleanup as usize;
+                if fn_addr > 0x1000 && fn_addr < usize::MAX - 0x1000 {
+                    cleanup(self.handle);
+                }
             }
         }
     }

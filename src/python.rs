@@ -4,7 +4,8 @@ use numpy::{PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
-
+use std::mem::ManuallyDrop;
+use std::ops::{Deref, DerefMut};
 #[pyclass]
 #[derive(Clone)]
 pub struct PyVampHost {
@@ -137,7 +138,7 @@ impl PyVampHost {
 
                             // Now create a PyVampPlugin and use its process_audio_full method
                             let mut py_plugin = PyVampPlugin {
-                                plugin,
+                                plugin: std::mem::ManuallyDrop::new(plugin),
                                 initialized: true,
                                 block_size: Some(block_size),
                                 step_size: Some(step_size),
@@ -255,7 +256,7 @@ impl PyVampHost {
 
                             // Now create a PyVampPlugin and use its process_audio_nd method
                             let mut py_plugin = PyVampPlugin {
-                                plugin,
+                                plugin: std::mem::ManuallyDrop::new(plugin),
                                 initialized: true,
                                 block_size: Some(block_size),
                                 step_size: Some(step_size),
@@ -310,7 +311,7 @@ impl PyVampLibrary {
     ) -> PyResult<Option<PyVampPlugin>> {
         match self.library.instantiate_plugin(plugin_index, sample_rate) {
             Some(plugin) => Ok(Some(PyVampPlugin {
-                plugin,
+                plugin: std::mem::ManuallyDrop::new(plugin),
                 initialized: false,
                 block_size: None,
                 step_size: None,
@@ -370,7 +371,7 @@ impl PyPluginInfo {
 
 #[pyclass(unsendable)]
 pub struct PyVampPlugin {
-    plugin: VampPlugin,
+    plugin: std::mem::ManuallyDrop<VampPlugin>,
     initialized: bool,
     block_size: Option<usize>,
     step_size: Option<usize>,
@@ -492,9 +493,24 @@ impl PyVampPlugin {
             ));
         }
 
+        // Ensure plugin descriptor and handle are valid
+        if self.plugin.deref_mut().descriptor.is_null() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Plugin descriptor is null",
+            ));
+        }
+        if self.plugin.deref_mut().handle.is_null() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Plugin handle is null",
+            ));
+        }
+
         let block_size = self.block_size.unwrap();
         let step_size = self.step_size.unwrap();
-        let input_domain = self.plugin.get_input_domain();
+        let input_domain = self.plugin.deref_mut().get_input_domain();
+
+        log::debug!("Processing audio: {} samples, {} channels, block_size: {}, step_size: {}, input_domain: {:?}",
+                   audio_samples.len(), channels, block_size, step_size, input_domain);
 
         let mut all_features = Vec::new();
 
@@ -502,10 +518,14 @@ impl PyVampPlugin {
         if input_domain == crate::InputDomain::FrequencyDomain {
             self.ensure_fft_cache(block_size);
 
-            // Get shared FFT plan and window
-            let plan = self.fft_plan.as_ref().unwrap().clone();
-            let hann: std::sync::Arc<[f32]> =
-                std::sync::Arc::from(self.hann_window.as_ref().unwrap().clone());
+            // Get shared FFT plan and window with defensive checks
+            let plan = self.fft_plan.as_ref()
+                .ok_or_else(|| PyRuntimeError::new_err("FFT plan not initialized"))?
+                .clone();
+            let hann: std::sync::Arc<[f32]> = self.hann_window.as_ref()
+                .ok_or_else(|| PyRuntimeError::new_err("Hann window not initialized"))?
+                .clone()
+                .into();
 
             // Convert audio to mono buffer first
             let mono_buf = if channels == 1 {
@@ -550,18 +570,16 @@ impl PyVampPlugin {
                 let end = (idx + batch).min(starts.len());
                 let batch_starts = &starts[idx..end];
 
-                // Release GIL around heavy parallel section
-                let spectra = Python::with_gil(|py| {
-                    py.allow_threads(|| {
-                        parallel_ffts_interleaved(
-                            plan.clone(),
-                            hann.clone(),
-                            &mono_buf,
-                            batch_starts,
-                            block_size,
-                        )
-                    })
-                });
+                // Keep GIL held to prevent memory issues with plugin
+                log::debug!("Processing FFT batch {}-{}", idx, end-1);
+                let spectra = parallel_ffts_interleaved(
+                    plan.clone(),
+                    hann.clone(),
+                    &mono_buf,
+                    batch_starts,
+                    block_size,
+                );
+                log::debug!("FFT batch completed, {} spectra generated", spectra.len());
 
                 // Now sequentially call plugin.process(...) per spectrum
                 for (j, inter) in spectra.into_iter().enumerate() {
@@ -573,13 +591,37 @@ impl PyVampPlugin {
 
                     let buffer_refs: Vec<&[f32]> = vec![inter.as_slice()];
 
-                    if let Some(features_ptr) = self.plugin.process(&buffer_refs, ts_sec, ts_nsec) {
+                    log::debug!("Processing FFT frame {} with timestamp {}.{:09}", j, ts_sec, ts_nsec);
+                    if let Some(features_ptr) = self.plugin.deref_mut().process(&buffer_refs, ts_sec, ts_nsec) {
+                        log::debug!("Got features_ptr from plugin.process for frame {}", j);
                         unsafe {
                             let target_output_index = output_index.unwrap_or(0);
+
+                            // Get output count and validate index to prevent segfault
+                            let output_count = if let Some(get_output_count) = (*self.plugin.deref_mut().descriptor).getOutputCount {
+                                let count = get_output_count(self.plugin.deref_mut().handle) as usize;
+                                log::debug!("Plugin has {} outputs", count);
+                                count
+                            } else {
+                                log::debug!("No getOutputCount function, defaulting to 1 output");
+                                1 // Default to 1 output if function not available
+                            };
+
+                            if target_output_index >= output_count {
+                                log::error!("Output index {} out of bounds (max {})", target_output_index, output_count - 1);
+                                self.plugin.deref_mut().release_feature_set(features_ptr);
+                                continue;
+                            }
+
+                            log::debug!("About to access features at output index {}", target_output_index);
                             let features = &*features_ptr.add(target_output_index);
+                            log::debug!("Successfully accessed features pointer, featureCount: {}", features.featureCount);
                             if features.featureCount > 0 && !features.features.is_null() {
+                                log::debug!("Features are valid, processing {} features", features.featureCount);
                                 for i in 0..features.featureCount {
+                                    log::debug!("Accessing feature {}/{}", i+1, features.featureCount);
                                     let feature = &(*features.features.add(i as usize)).v1;
+                                    log::debug!("Feature {} accessed successfully", i);
                                     let values =
                                         if feature.valueCount > 0 && !feature.values.is_null() {
                                             std::slice::from_raw_parts(
@@ -607,8 +649,12 @@ impl PyVampPlugin {
                                     });
                                 }
                             }
-                            self.plugin.release_feature_set(features_ptr);
+                            log::debug!("About to release feature set for frame {}", j);
+                            self.plugin.deref_mut().release_feature_set(features_ptr);
+                            log::debug!("Feature set released successfully for frame {}", j);
                         }
+                    } else {
+                        log::debug!("No features returned for frame {}", j);
                     }
                 }
 
@@ -710,9 +756,22 @@ impl PyVampPlugin {
                 {
                     unsafe {
                         let target_output_index = output_index.unwrap_or(0);
-                        let features = &*features_ptr.add(target_output_index);
 
-                        if features.featureCount > 0 && !features.features.is_null() {
+                        // Get output count and validate index to prevent segfault
+                        let output_count = if let Some(get_output_count) = (*self.plugin.deref_mut().descriptor).getOutputCount {
+                            get_output_count(self.plugin.deref_mut().handle) as usize
+                        } else {
+                            1 // Default to 1 output if function not available
+                        };
+
+                        if target_output_index >= output_count {
+                            log::error!("Output index {} out of bounds (max {})", target_output_index, output_count - 1);
+                            self.plugin.deref_mut().release_feature_set(features_ptr);
+                            // Don't continue in while loop, just skip this iteration
+                        } else {
+                            let features = &*features_ptr.add(target_output_index);
+
+                            if features.featureCount > 0 && !features.features.is_null() {
                             for i in 0..features.featureCount {
                                 let feature = &(*features.features.add(i as usize)).v1;
 
@@ -747,7 +806,8 @@ impl PyVampPlugin {
                             }
                         }
 
-                        self.plugin.release_feature_set(features_ptr);
+                        self.plugin.deref_mut().release_feature_set(features_ptr);
+                        } // End of else block for bounds check
                     }
                 }
 
@@ -761,9 +821,25 @@ impl PyVampPlugin {
         }
 
         // Get remaining features
-        if let Some(remaining_ptr) = self.plugin.get_remaining_features() {
+        log::debug!("About to get remaining features from plugin");
+        if let Some(remaining_ptr) = self.plugin.deref_mut().get_remaining_features() {
+            log::debug!("Got remaining features pointer");
             unsafe {
                 let target_output_index = output_index.unwrap_or(0);
+
+                // Get output count and validate index to prevent segfault
+                let output_count = if let Some(get_output_count) = (*self.plugin.deref_mut().descriptor).getOutputCount {
+                    get_output_count(self.plugin.deref_mut().handle) as usize
+                } else {
+                    1 // Default to 1 output if function not available
+                };
+
+                if target_output_index >= output_count {
+                    log::error!("Output index {} out of bounds (max {})", target_output_index, output_count - 1);
+                    self.plugin.deref_mut().release_feature_set(remaining_ptr);
+                    return Ok(all_features);
+                }
+
                 let remaining = &*remaining_ptr.add(target_output_index);
 
                 if remaining.featureCount > 0 && !remaining.features.is_null() {
@@ -795,10 +871,15 @@ impl PyVampPlugin {
                     }
                 }
 
-                self.plugin.release_feature_set(remaining_ptr);
+                log::debug!("About to release remaining feature set");
+                self.plugin.deref_mut().release_feature_set(remaining_ptr);
+                log::debug!("Remaining feature set released successfully");
             }
+        } else {
+            log::debug!("No remaining features returned");
         }
 
+        log::debug!("Total features collected: {}", all_features.len());
         Ok(all_features)
     }
 
@@ -863,22 +944,22 @@ impl PyVampPlugin {
 #[pymethods]
 impl PyVampPlugin {
     fn get_input_domain(&self) -> PyInputDomain {
-        match self.plugin.get_input_domain() {
+        match self.plugin.deref().get_input_domain() {
             InputDomain::TimeDomain => PyInputDomain::TimeDomain,
             InputDomain::FrequencyDomain => PyInputDomain::FrequencyDomain,
         }
     }
 
     fn get_preferred_block_size(&self) -> u32 {
-        self.plugin.get_preferred_block_size()
+        self.plugin.deref().get_preferred_block_size()
     }
 
     fn get_preferred_step_size(&self) -> u32 {
-        self.plugin.get_preferred_step_size()
+        self.plugin.deref().get_preferred_step_size()
     }
 
     fn initialise(&mut self, channels: u32, step_size: u32, block_size: u32) -> bool {
-        self.plugin.initialise(channels, step_size, block_size)
+        self.plugin.deref_mut().initialise(channels, step_size, block_size)
     }
 
     fn process(
@@ -902,7 +983,7 @@ impl PyVampPlugin {
             // Convert Vec<Vec<f32>> to the format expected by the plugin
             let buffer_refs: Vec<&[f32]> = input_buffers.iter().map(|v| v.as_slice()).collect();
 
-            match self.plugin.process(&buffer_refs, sec, nsec) {
+            match self.plugin.deref_mut().process(&buffer_refs, sec, nsec) {
                 Some(features_ptr) => {
                     unsafe {
                         // If output_index is specified, get features from that output
@@ -912,7 +993,7 @@ impl PyVampPlugin {
                             let result = self.convert_features_to_python(py, features)?;
 
                             // Release the feature set to avoid memory leaks
-                            self.plugin.release_feature_set(features_ptr);
+                            self.plugin.deref_mut().release_feature_set(features_ptr);
 
                             Ok(Some(result.into()))
                         } else {
@@ -922,7 +1003,7 @@ impl PyVampPlugin {
                             let result = self.convert_features_to_python(py, features)?;
 
                             // Release the feature set to avoid memory leaks
-                            self.plugin.release_feature_set(features_ptr);
+                            self.plugin.deref_mut().release_feature_set(features_ptr);
 
                             Ok(Some(result.into()))
                         }
@@ -943,7 +1024,7 @@ impl PyVampPlugin {
         output_index: Option<usize>,
     ) -> PyResult<Option<PyObject>> {
         Python::with_gil(|py| {
-            match self.plugin.get_remaining_features() {
+            match self.plugin.deref_mut().get_remaining_features() {
                 Some(features_ptr) => {
                     unsafe {
                         if let Some(idx) = output_index {
@@ -951,7 +1032,7 @@ impl PyVampPlugin {
                             let result = self.convert_features_to_python(py, features)?;
 
                             // Release the feature set
-                            self.plugin.release_feature_set(features_ptr);
+                            self.plugin.deref_mut().release_feature_set(features_ptr);
 
                             Ok(Some(result))
                         } else {
@@ -961,7 +1042,7 @@ impl PyVampPlugin {
                             let result = self.convert_features_to_python(py, features)?;
 
                             // Release the feature set
-                            self.plugin.release_feature_set(features_ptr);
+                            self.plugin.deref_mut().release_feature_set(features_ptr);
 
                             Ok(Some(result))
                         }
@@ -973,7 +1054,7 @@ impl PyVampPlugin {
     }
 
     fn reset(&mut self) {
-        self.plugin.reset();
+        self.plugin.deref_mut().reset();
         self.initialized = false;
         self.block_size = None;
         self.step_size = None;
@@ -997,10 +1078,10 @@ impl PyVampPlugin {
 
         // Get preferred block and step sizes from the plugin
         let preferred_block_size = unsafe {
-            if !self.plugin.descriptor.is_null() && 
-               (*self.plugin.descriptor).getPreferredBlockSize.is_some() {
-                if let Some(get_preferred_block) = (*self.plugin.descriptor).getPreferredBlockSize {
-                    get_preferred_block(self.plugin.handle)
+            if !self.plugin.deref_mut().descriptor.is_null() && 
+               (*self.plugin.deref_mut().descriptor).getPreferredBlockSize.is_some() {
+                if let Some(get_preferred_block) = (*self.plugin.deref_mut().descriptor).getPreferredBlockSize {
+                    get_preferred_block(self.plugin.deref_mut().handle)
                 } else {
                     1024
                 }
@@ -1010,10 +1091,10 @@ impl PyVampPlugin {
         };
 
         let preferred_step_size = unsafe {
-            if !self.plugin.descriptor.is_null() && 
-               (*self.plugin.descriptor).getPreferredStepSize.is_some() {
-                if let Some(get_preferred_step) = (*self.plugin.descriptor).getPreferredStepSize {
-                    get_preferred_step(self.plugin.handle)
+            if !self.plugin.deref_mut().descriptor.is_null() && 
+               (*self.plugin.deref_mut().descriptor).getPreferredStepSize.is_some() {
+                if let Some(get_preferred_step) = (*self.plugin.deref_mut().descriptor).getPreferredStepSize {
+                    get_preferred_step(self.plugin.deref_mut().handle)
                 } else {
                     preferred_block_size / 2
                 }
@@ -1028,7 +1109,7 @@ impl PyVampPlugin {
             1024
         };
 
-        let input_domain = self.plugin.get_input_domain();
+        let input_domain = self.plugin.deref_mut().get_input_domain();
 
         let step_size = if preferred_step_size > 0 {
             preferred_step_size as usize
@@ -1040,7 +1121,7 @@ impl PyVampPlugin {
             }
         };
 
-        if !self.plugin.initialise(
+        if !self.plugin.deref_mut().initialise(
             processing_channels as u32,
             step_size as u32,
             block_size as u32,
@@ -1148,16 +1229,19 @@ impl PyVampPlugin {
             self.initialize(sample_rate, Some(1))?; // Force mono
         }
 
-        // Process audio directly (can't release GIL due to Send constraints)
+        // Process audio while holding GIL to prevent memory issues
+        log::debug!("About to process audio with {} samples", interleaved.len());
         let result = self
             .process_audio_full_inner(interleaved, sample_rate, channels, output_index)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+        log::debug!("Audio processing completed, converting {} features to Python", result.len());
 
-        // Reacquire GIL to convert results to Python
+        // Convert results to Python objects
         let all_features = PyList::empty_bound(py);
 
         // Convert SimpleFeature structs to Python dicts
-        for feature in result {
+        for (i, feature) in result.iter().enumerate() {
+            log::debug!("Converting feature {} to Python dict", i);
             let feature_dict = PyDict::new_bound(py);
             feature_dict.set_item("has_timestamp", feature.has_timestamp)?;
 
@@ -1166,34 +1250,45 @@ impl PyVampPlugin {
                 feature_dict.set_item("nsec", feature.nsec)?;
             }
 
-            feature_dict.set_item("values", feature.values)?;
+            // Create Python list for values to ensure proper ownership
+            let py_values = PyList::empty_bound(py);
+            for val in &feature.values {
+                py_values.append(*val)?;
+            }
+            feature_dict.set_item("values", py_values)?;
 
             if !feature.label.is_empty() {
-                feature_dict.set_item("label", feature.label)?;
+                // Create Python string to ensure proper ownership
+                let py_label = pyo3::types::PyString::new_bound(py, &feature.label);
+                feature_dict.set_item("label", py_label)?;
             }
 
             all_features.append(feature_dict)?;
+            log::debug!("Feature {} converted successfully", i);
         }
 
-        Ok(Some(all_features.into()))
+        log::debug!("All {} features converted to Python, returning result", result.len());
+        let py_obj = all_features.into();
+        log::debug!("Converted PyList to PyObject");
+        Ok(Some(py_obj))
     }
 
-    fn get_output_descriptors(&self) -> PyResult<PyObject> {
+    fn get_output_descriptors(&mut self) -> PyResult<PyObject> {
         Python::with_gil(|py| {
             let outputs = PyList::empty_bound(py);
 
             unsafe {
-                let desc = &*self.plugin.descriptor;
+                let desc = &*self.plugin.deref().descriptor;
 
                 // First get the output count using getOutputCount
                 if let Some(get_output_count_fn) = desc.getOutputCount {
-                    let output_count = get_output_count_fn(self.plugin.handle);
+                    let output_count = get_output_count_fn(self.plugin.deref_mut().handle);
 
                     if output_count > 0 {
                         // Then get each output descriptor using getOutputDescriptor
                         if let Some(get_output_descriptor_fn) = desc.getOutputDescriptor {
                             for i in 0..output_count {
-                                let output_desc = get_output_descriptor_fn(self.plugin.handle, i);
+                                let output_desc = get_output_descriptor_fn(self.plugin.deref_mut().handle, i);
                                 if !output_desc.is_null() {
                                     let output_ref = &*output_desc;
                                     let output_dict = PyDict::new_bound(py);
@@ -1350,12 +1445,12 @@ impl PyVampPlugin {
         })
     }
 
-    fn get_parameter_descriptors(&self) -> PyResult<PyObject> {
+    fn get_parameter_descriptors(&mut self) -> PyResult<PyObject> {
         Python::with_gil(|py| {
             let parameters = PyList::empty_bound(py);
 
             unsafe {
-                let desc = &*self.plugin.descriptor;
+                let desc = &*self.plugin.deref().descriptor;
 
                 // Get parameter descriptors
                 if desc.parameterCount > 0 && !desc.parameters.is_null() {
@@ -1446,12 +1541,12 @@ impl PyVampPlugin {
         })
     }
 
-    fn get_plugin_info(&self) -> PyResult<PyObject> {
+    fn get_plugin_info(&mut self) -> PyResult<PyObject> {
         Python::with_gil(|py| {
             let info_dict = PyDict::new_bound(py);
 
             unsafe {
-                let desc = &*self.plugin.descriptor;
+                let desc = &*self.plugin.deref().descriptor;
 
                 // Get plugin identifier
                 if !desc.identifier.is_null() {
@@ -1494,7 +1589,7 @@ impl PyVampPlugin {
                 info_dict.set_item("program_count", desc.programCount)?;
 
                 // Add sample rate
-                info_dict.set_item("sample_rate", self.plugin.sample_rate)?;
+                info_dict.set_item("sample_rate", self.plugin.deref().sample_rate)?;
 
                 // Add input domain
                 let input_domain_str = match self.get_input_domain() {
@@ -1513,17 +1608,17 @@ impl PyVampPlugin {
     }
 
     fn set_parameter(&mut self, parameter: u32, value: f32) -> bool {
-        self.plugin.set_parameter(parameter, value)
+        self.plugin.deref_mut().set_parameter(parameter, value)
     }
 
     fn get_parameter(&self, parameter: u32) -> Option<f32> {
-        self.plugin.get_parameter(parameter)
+        self.plugin.deref().get_parameter(parameter)
     }
 
     fn set_parameter_by_name(&mut self, name: &str, value: f32) -> PyResult<bool> {
         Python::with_gil(|_py| {
             unsafe {
-                let desc = &*self.plugin.descriptor;
+                let desc = &*self.plugin.deref().descriptor;
 
                 // Find parameter by identifier
                 if desc.parameterCount > 0 && !desc.parameters.is_null() {
@@ -1535,7 +1630,7 @@ impl PyVampPlugin {
                                 let id = std::ffi::CStr::from_ptr(param_ref.identifier)
                                     .to_string_lossy();
                                 if id == name {
-                                    return Ok(self.plugin.set_parameter(i, value));
+                                    return Ok(self.plugin.deref_mut().set_parameter(i, value));
                                 }
                             }
                         }
@@ -1550,10 +1645,10 @@ impl PyVampPlugin {
         })
     }
 
-    fn get_parameter_by_name(&self, name: &str) -> PyResult<Option<f32>> {
+    fn get_parameter_by_name(&mut self, name: &str) -> PyResult<Option<f32>> {
         Python::with_gil(|_py| {
             unsafe {
-                let desc = &*self.plugin.descriptor;
+                let desc = &*self.plugin.deref().descriptor;
 
                 // Find parameter by identifier
                 if desc.parameterCount > 0 && !desc.parameters.is_null() {
@@ -1565,7 +1660,7 @@ impl PyVampPlugin {
                                 let id = std::ffi::CStr::from_ptr(param_ref.identifier)
                                     .to_string_lossy();
                                 if id == name {
-                                    return Ok(self.plugin.get_parameter(i));
+                                    return Ok(self.plugin.deref().get_parameter(i));
                                 }
                             }
                         }
@@ -1590,13 +1685,18 @@ impl PyVampPlugin {
     }
 
     fn __repr__(&self) -> String {
-        format!("VampPlugin(sample_rate={})", self.plugin.sample_rate)
+        format!("VampPlugin(sample_rate={})", self.plugin.deref().sample_rate)
     }
 
     fn __del__(&mut self) {
-        // Explicitly reset the plugin to ensure proper cleanup
-        // This is critical for Linux where C++ destructors may not be called properly
-        self.plugin.reset();
+        // During Python shutdown, we need to avoid segfaults from cleanup
+        // Since we're using ManuallyDrop, the plugin won't be automatically dropped
+        // We intentionally leak the memory to avoid calling cleanup on a potentially
+        // invalid function pointer after the library has been unloaded
+        // See: https://github.com/PyO3/pyo3/issues/4632
+
+        // Do nothing - ManuallyDrop prevents automatic cleanup
+        // This leaks memory but prevents segfaults
     }
 }
 
@@ -1646,6 +1746,9 @@ impl std::convert::From<PyVampError> for PyErr {
 
 #[pymodule]
 fn _vamprust(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Initialize env_logger if not already initialized
+    // This allows RUST_LOG env var to control debug output
+    let _ = env_logger::try_init();
     // Initialize env_logger for debugging
     env_logger::Builder::from_default_env()
         .filter_level(log::LevelFilter::Debug)

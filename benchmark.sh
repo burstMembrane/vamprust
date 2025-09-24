@@ -1,7 +1,7 @@
 GIT_HASH_SHORT=$(git rev-parse --short HEAD)
 BRANCH=$(git rev-parse --abbrev-ref HEAD)
 simple_host_cmd="vamp-simple-host-rs"
-cmd_one="./vamp-plugin-sdk/build/vamp-simple-host nnls-chroma:chordino test.wav"
+cmd_one="vamp-simple-host nnls-chroma:chordino test.wav"
 cmd_two="vamp-simple-host-rs nnls-chroma:chordino test.wav"
 cmd_three="python3 python/examples/chordino.py test.wav"
 mkdir -p benchmarks

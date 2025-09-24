@@ -28,8 +28,9 @@ classifiers = [
 dependencies = [
     "maturin>=1.9.4",
     "numpy>=1.20.0",
- "rapidfuzz>=3.9.7",
- "soundfile>=0.13.1",
+    "rapidfuzz>=3.9.7",
+    "soundfile>=0.13.1",
+    "soxr>=0.3.7",
 ]
 
 [tool.mypy]
@@ -70,4 +71,8 @@ vamprust-cli = "vamprust.cli:main"
 [dependency-groups]
 audio = ["soxr>=0.3.7"]
 csv = ["pandas>=1.5.0"]
-dev = ["ipykernel>=6.29.5", "line-profiler>=5.0.0"]
+dev = [
+    "ipykernel>=6.29.5",
+ "line-profiler>=5.0.0",
+ "pyinstrument>=5.1.1",
+]

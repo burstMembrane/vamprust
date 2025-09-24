@@ -67,7 +67,9 @@ def main() -> None:
         f"Loaded audio from {AUDIO_PATH}, sample rate: {sr}, length: {len(audio)} samples"
     )
 
-    AudioProcessor().process_audio(
+    processor = AudioProcessor()
+    print("Created AudioProcessor")
+    features = processor.process_audio(
         "chordino",
         audio,
         sample_rate=sr,
@@ -82,6 +84,9 @@ def main() -> None:
         },
     )
 
+    print(f"Got {len(features)} features")
+    if features:
+        print_chords(features)
 
 if __name__ == "__main__":
     main()
